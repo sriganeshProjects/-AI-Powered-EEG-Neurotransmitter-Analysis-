@@ -1,0 +1,196 @@
+# Colab-ready: EEG -> neurotransmitter estimates (CSV, PDF, JPG, PNG, JPEG)
+!pip install PyMuPDF pillow scikit-learn pandas numpy matplotlib pdfplumber --quiet
+
+import io, os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+import fitz           # PyMuPDF
+from scipy.signal import welch
+from sklearn.ensemble import RandomForestRegressor
+from google.colab import files
+
+plt.rcParams['figure.figsize'] = (10,4)
+
+# ----------------------------
+# Band-power helpers
+# ----------------------------
+def bandpower(psd_freqs, psd, fmin, fmax):
+    mask = (psd_freqs >= fmin) & (psd_freqs <= fmax)
+    if not mask.any():
+        return 0.0
+    return np.trapz(psd[mask], psd_freqs[mask]) / (fmax - fmin)
+
+def extract_band_powers(signal, sf=256, nperseg=512):
+    s = np.asarray(signal).astype(float).flatten()
+    if len(s) < 10:
+        s = np.concatenate([s, np.random.randn(256)])  # pad tiny signals
+    nperseg = min(nperseg, len(s))
+    freqs, psd = welch(s, fs=sf, nperseg=nperseg)
+    bands = {'delta':(0.5,4),'theta':(4,8),'alpha':(8,13),'beta':(13,30),'gamma':(30,45)}
+    bp = {}
+    total = 0.0
+    for name,(lo,hi) in bands.items():
+        p = bandpower(freqs, psd, lo, hi)
+        bp[name] = p
+        total += p
+    for name in list(bands.keys()):
+        bp[name + '_r'] = bp[name] / total if total>0 else 0.0
+    return bp
+
+# ----------------------------
+# Heuristic mapping and refs
+# ----------------------------
+HEURISTIC_WEIGHTS = {
+    'dopamine': {'beta_r': 1.1, 'gamma_r': 0.5, 'alpha_r': -0.4},
+    'serotonin': {'alpha_r': 1.0, 'theta_r': -0.3},
+    'gaba': {'beta_r': 0.8, 'alpha_r': 0.6},
+    'acetylcholine': {'theta_r': 0.9, 'gamma_r': 0.35}
+}
+NORMAL_REFERENCE = {'dopamine':50.0,'serotonin':60.0,'gaba':45.0,'acetylcholine':55.0}
+
+def heuristic_estimate(bp):
+    out = {}
+    for neuro, wmap in HEURISTIC_WEIGHTS.items():
+        s = sum(w * bp.get(k,0.0) for k,w in wmap.items())
+        out[neuro] = float(50 + 100*s)  # demo scaling
+    return out
+
+# ----------------------------
+# Quick simulated train (fast)
+# ----------------------------
+def simulate_dataset(n=250, sf=256):
+    X=[]; Y=[]
+    for _ in range(n):
+        t = np.arange(0,5,1/sf)
+        sig = (np.random.uniform(0.05,1.0)*np.sin(2*np.pi*np.random.uniform(9,11)*t) +
+               np.random.uniform(0.02,0.8)*np.sin(2*np.pi*np.random.uniform(15,20)*t) +
+               np.random.normal(0,0.5,len(t)))
+        bp = extract_band_powers(sig, sf=sf, nperseg=256)
+        X.append([bp['delta_r'],bp['theta_r'],bp['alpha_r'],bp['beta_r'],bp['gamma_r']])
+        # pseudo ground truth (demo formula)
+        d = 50 + 120*(0.5*bp['beta_r'] + 0.3*bp['gamma_r'] - 0.2*bp['alpha_r'])
+        s = 60 + 100*(0.8*bp['alpha_r'] - 0.2*bp['theta_r'])
+        g = 45 + 90*(0.5*bp['alpha_r'] + 0.4*bp['beta_r'])
+        a = 55 + 80*(0.6*bp['theta_r'] + 0.3*bp['gamma_r'])
+        Y.append([d,s,g,a])
+    return np.array(X), np.array(Y)
+
+print("Training tiny AI model (fast demo)...")
+Xsim, Ysim = simulate_dataset(280)
+model = RandomForestRegressor(n_estimators=60, random_state=1).fit(Xsim, Ysim)
+print("Model ready.")
+
+# ----------------------------
+# Read uploaded file robustly
+# ----------------------------
+print("Upload a file: CSV, PDF, JPG, PNG, or JPEG")
+uploaded = files.upload()
+if not uploaded:
+    raise SystemExit("No file uploaded. Run the cell and upload a file.")
+
+fname = list(uploaded.keys())[0]
+ext = os.path.splitext(fname)[1].lower()
+signal = None
+sf = 256
+
+try:
+    if ext == '.csv':
+        df = pd.read_csv(fname)
+        nums = df.select_dtypes(include=[np.number]).columns.tolist()
+        if 'EEG' in df.columns:
+            eeg_col = 'EEG'
+        elif len(nums) >= 2:
+            eeg_col = nums[1]
+        elif len(nums) == 1:
+            eeg_col = nums[0]
+        else:
+            raise ValueError("No numeric column in CSV.")
+        if 'Time' in df.columns:
+            t = df['Time'].dropna().to_numpy()
+            if len(t) >= 2:
+                dt = float(np.mean(np.diff(t)))
+                if dt>1e-6:
+                    sf = int(round(1.0/dt))
+        signal = df[eeg_col].dropna().to_numpy()
+        print(f"CSV loaded. Using column '{eeg_col}'. sf≈{sf} Hz")
+
+    elif ext in ('.png','.jpg','.jpeg'):
+        img = Image.open(fname).convert('L')
+        arr = np.array(img)
+        mid = arr[arr.shape[0]//2]            # middle row heuristic
+        signal = (255 - mid).astype(float)   # invert for darker trace -> higher values
+        print("Image loaded; middle row converted to 1D signal.")
+
+    elif ext == '.pdf':
+        doc = fitz.open(fname)
+        page = doc.load_page(0)
+        pix = page.get_pixmap(alpha=False)
+        img = Image.open(io.BytesIO(pix.tobytes())).convert('L')
+        arr = np.array(img)
+        mid = arr[arr.shape[0]//2]
+        signal = (255 - mid).astype(float)
+        print("PDF page 1 loaded and converted to 1D signal (middle row).")
+
+    else:
+        raise ValueError("Unsupported file type.")
+
+except Exception as e:
+    print("Warning reading file:", e)
+    # fallback simulated signal
+    t = np.arange(0,5,1/sf)
+    signal = 0.6*np.sin(2*np.pi*10*t) + 0.4*np.sin(2*np.pi*18*t) + np.random.randn(len(t))*0.5
+    print("Using simulated fallback signal.")
+
+# ----------------------------
+# Features, estimates & plots
+# ----------------------------
+bp = extract_band_powers(signal, sf=sf, nperseg=min(512,len(signal)))
+heur = heuristic_estimate(bp)
+feat = np.array([[bp['delta_r'],bp['theta_r'],bp['alpha_r'],bp['beta_r'],bp['gamma_r']]])
+ai_pred = model.predict(feat)[0]
+ai_est = dict(zip(['dopamine','serotonin','gaba','acetylcholine'], map(float, ai_pred)))
+applied = {k:(ai_est[k] + heur[k])/2.0 for k in ai_est}
+
+# Plot 1: EEG waveform
+plt.figure(figsize=(12,3))
+t_axis = np.arange(len(signal))/float(sf)
+plt.plot(t_axis, signal, linewidth=0.8)
+plt.xlabel("Time (s)")
+plt.ylabel("Signal (a.u.)")
+plt.title("EEG Trace (or extracted waveform)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()   # first plt.show()
+
+# Plot 2: Neurotransmitter comparison
+neuros = ['dopamine','serotonin','gaba','acetylcholine']
+x = np.arange(len(neuros)); w=0.2
+vals_ai = [ai_est[n] for n in neuros]
+vals_heur = [heur[n] for n in neuros]
+vals_norm = [NORMAL_REFERENCE[n] for n in neuros]
+vals_app = [applied[n] for n in neuros]
+
+plt.figure(figsize=(10,4))
+plt.bar(x-1.5*w, vals_ai, w, label='AI')
+plt.bar(x-0.5*w, vals_heur, w, label='Software')
+plt.bar(x+0.5*w, vals_norm, w, label='Normal')
+plt.bar(x+1.5*w, vals_app, w, label='Applied AI')
+plt.xticks(x, [n.capitalize() for n in neuros])
+plt.ylabel('Demo units')
+plt.title('Neurotransmitter Estimates')
+plt.legend()
+plt.tight_layout()
+plt.show()   # final plt.show()
+
+# Human-friendly summary
+print("\nSimple summary (demo only):")
+for n in neuros:
+    v = ai_est[n]; ref = NORMAL_REFERENCE[n]
+    if v > ref*1.1: interp = "higher than typical"
+    elif v < ref*0.9: interp = "lower than typical"
+    else: interp = "within typical range"
+    print(f" - {n.capitalize()}: {v:.1f} → {interp}")
+
+print("\nNote: Demo prototype. Not clinically validated. Use for research/education only.")
